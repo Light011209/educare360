@@ -2382,7 +2382,7 @@
     }
 
     // =========================================================================
-    // LUỒNG GIẢI ĐÁP ÁN & HƯỚNG DẪN CÁCH LÀM CHI TIẾT TỪNG CÂU (TỰ ĐỘNG CHIA LÔ 100%)
+    // LUỒNG GIẢI ĐÁP ÁN & HƯỚNG DẪN CÁCH LÀM CHI TIẾT TỪNG CÂU (TỰ ĐỘNG CHIA LÔ + CHỐNG VỠ JSON)
     // =========================================================================
     function splitTextIntoQuestionChunks(fullText, questionsPerBatch) {
       if (!fullText || !fullText.trim()) return [];
@@ -2391,7 +2391,7 @@
 
       if (parts.length <= 1) {
         const chunks = [];
-        const maxChars = 7500;
+        const maxChars = 4200;
         for (let i = 0; i < fullText.length; i += maxChars) {
           chunks.push({
             text: fullText.slice(i, i + maxChars),
@@ -2416,10 +2416,73 @@
         const rangeLabel = (firstMatch && lastMatch)
           ? `Câu ${firstMatch[1]} → Câu ${lastMatch[1]}`
           : `Nhóm ${chunks.length + 1}`;
-        const chunkBody = (preamble ? `[ĐỀ MỤC / NGỮ LIỆU CHUNG]:\n${preamble}\n\n` : '') + slice.join('\n\n');
-        chunks.push({ text: chunkBody, label: rangeLabel });
+        const chunkBody = (preamble ? `[ĐỀ MỤC / NGỮ LIỆU CHUNG]:\n${preamble.slice(0, 1200)}\n\n` : '') + slice.join('\n\n');
+        chunks.push({ text: chunkBody, label: rangeLabel, rawItems: slice, preamble: preamble.slice(0, 1200) });
       }
       return chunks;
+    }
+
+    async function callSolveBatchWithAutoRetry(batch, baseConfig, signal, onRetryStatus) {
+      const sendRequest = async (textQ, imgs) => {
+        const payload = {
+          mode: 'solve_exercises',
+          grade: baseConfig.grade,
+          subjectName: baseConfig.subjectName,
+          subject: baseConfig.subject,
+          solveStyle: baseConfig.solveStyle,
+          ragContext: baseConfig.ragContext,
+          textQuestions: textQ,
+          images: imgs
+        };
+        const res = await fetch(APPS_SCRIPT_URL, {
+          method: 'POST',
+          redirect: 'follow',
+          signal: signal,
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(payload)
+        });
+        return await res.json();
+      };
+
+      let json = await sendRequest(batch.textQuestions, batch.images);
+      if (json.success && json.data && Array.isArray(json.data.solutions)) {
+        return json.data.solutions;
+      }
+
+      // Nếu lỗi vỡ/cắt JSON do gói quá dài -> tự động chia đôi lô hiện tại để giải tiếp
+      const errMsg = String(json.error || '');
+      if (/json|unterminated|unexpected|position|token|parse/i.test(errMsg)) {
+        if (batch.rawItems && batch.rawItems.length > 1) {
+          if (onRetryStatus) onRetryStatus(`Gói ${batch.label} hơi dài, tự tách đôi để không vỡ JSON...`);
+          const mid = Math.ceil(batch.rawItems.length / 2);
+          const halves = [batch.rawItems.slice(0, mid), batch.rawItems.slice(mid)];
+          let merged = [];
+          for (let h = 0; h < halves.length; h++) {
+            const subItems = halves[h];
+            if (subItems.length === 0) continue;
+            const subBody = (batch.preamble ? `[NGỮ LIỆU CHUNG]:\n${batch.preamble}\n\n` : '') + subItems.join('\n\n');
+            const subPrompt = `[NHIỆM VỤ BẮT BUỘC - PHẦN TÁCH NHỎ ${h + 1}/2]: Giải ĐẦY ĐỦ 100% các câu sau theo đúng thứ tự, trình bày ngắn gọn súc tích, không dùng dấu ngoặc kép thừa làm vỡ JSON:\n\n${subBody}`;
+            const subJson = await sendRequest(subPrompt, h === 0 ? batch.images : []);
+            if (subJson.success && subJson.data && Array.isArray(subJson.data.solutions)) {
+              merged = merged.concat(subJson.data.solutions);
+            }
+          }
+          if (merged.length > 0) return merged;
+        } else if (batch.images && batch.images.length > 1) {
+          if (onRetryStatus) onRetryStatus(`Tách lẻ từng trang ảnh trong ${batch.label}...`);
+          let merged = [];
+          for (let i = 0; i < batch.images.length; i++) {
+            const singlePrompt = `[NHIỆM VỤ BẮT BUỘC]: Đọc và giải ĐẦY ĐỦ 100% các câu trong trang ảnh này theo đúng thứ tự, viết ngắn gọn chuẩn xác.`;
+            const subJson = await sendRequest(singlePrompt, [batch.images[i]]);
+            if (subJson.success && subJson.data && Array.isArray(subJson.data.solutions)) {
+              merged = merged.concat(subJson.data.solutions);
+            }
+          }
+          if (merged.length > 0) return merged;
+        }
+      }
+
+      throw new Error(json.error || 'Dữ liệu trả về chưa đúng định dạng');
     }
 
     async function processSolveExercises() {
@@ -2455,7 +2518,8 @@
       const knttInfo = getSelectedKnttContext('solver');
       const solveStyle = document.getElementById('solverModeSelect').value;
       const fullSubjectLabel = `${knttInfo.subj} Lớp ${knttInfo.grade} (Kết nối tri thức - GDPT 2026)`;
-      const questionsPerBatch = solveStyle === 'quick_key' ? 20 : 12;
+      // Giảm xuống 10 câu (chốt nhanh) và 6 câu (chi tiết) để không bao giờ chạm trần JSON 12.392 ký tự
+      const questionsPerBatch = solveStyle === 'quick_key' ? 10 : 6;
 
       const batches = [];
       if (docsText) {
@@ -2463,19 +2527,21 @@
         textChunks.forEach((ch, idx) => {
           batches.push({
             label: ch.label,
+            rawItems: ch.rawItems,
+            preamble: ch.preamble,
             textQuestions: [
               manualText ? `[YÊU CẦU CỦA HỌC SINH]: ${manualText}` : '',
-              `[NHIỆM VỤ BẮT BUỘC - LÔ ${idx + 1}/${textChunks.length} (${ch.label})]: Hãy giải ĐẦY ĐỦ 100% TẤT CẢ các câu hỏi xuất hiện trong đoạn đề dưới đây theo đúng thứ tự từ đầu đến cuối, TUYỆT ĐỐI KHÔNG ĐƯỢC BỎ SÓT hay nhảy cóc bất kỳ câu nào.\n\n${ch.text}`
+              `[NHIỆM VỤ BẮT BUỘC - LÔ ${idx + 1}/${textChunks.length} (${ch.label})]: Hãy giải ĐẦY ĐỦ 100% TẤT CẢ các câu hỏi xuất hiện trong đoạn đề dưới đây theo đúng thứ tự từ đầu đến cuối, TUYỆT ĐỐI KHÔNG ĐƯỢC BỎ SÓT câu nào. Giải thích súc tích, rõ ý.\n\n${ch.text}`
             ].filter(Boolean).join('\n\n'),
-            images: idx === 0 && solverImages.length <= 3
+            images: idx === 0 && solverImages.length <= 2
               ? solverImages.map(img => ({ base64: img.base64, mimeType: img.mimeType }))
               : []
           });
         });
       }
 
-      if (solverImages.length > 0 && (!docsText || solverImages.length > 3)) {
-        const imgsPerBatch = 3;
+      if (solverImages.length > 0 && (!docsText || solverImages.length > 2)) {
+        const imgsPerBatch = 2;
         for (let i = 0; i < solverImages.length; i += imgsPerBatch) {
           const imgSlice = solverImages.slice(i, i + imgsPerBatch);
           const pageLabel = `Trang ảnh ${i + 1}→${i + imgSlice.length}`;
@@ -2509,6 +2575,13 @@
       };
 
       const seenQuestions = new Set();
+      const baseConfig = {
+        grade: knttInfo.grade,
+        subjectName: knttInfo.subj,
+        subject: fullSubjectLabel,
+        solveStyle: solveStyle,
+        ragContext: knttInfo.fullContext
+      };
 
       try {
         for (let bIdx = 0; bIdx < batches.length; bIdx++) {
@@ -2517,37 +2590,19 @@
           const batch = batches[bIdx];
           currentBatchStatus = `Đang giải lượt ${bIdx + 1}/${batches.length} (${batch.label})...`;
           loadingText.textContent = `✍️ ${currentBatchStatus} (${seconds}s)`;
-          loadingSub.textContent = `Đã giải xong ${solvedRecord.solutions.length} câu • Tự động chia nhỏ để không bỏ sót câu nào...`;
+          loadingSub.textContent = `Đã giải xong ${solvedRecord.solutions.length} câu • Tự động chia nhỏ & chống cắt ngang JSON...`;
 
-          const payload = {
-            mode: 'solve_exercises',
-            grade: knttInfo.grade,
-            subjectName: knttInfo.subj,
-            subject: fullSubjectLabel,
-            solveStyle: solveStyle,
-            ragContext: knttInfo.fullContext,
-            textQuestions: batch.textQuestions,
-            images: batch.images
-          };
-
-          const res = await fetch(APPS_SCRIPT_URL, {
-            method: 'POST',
-            redirect: 'follow',
-            signal: currentAbortController.signal,
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify(payload)
-          });
-          const json = await res.json();
-
-          if (!json.success || !json.data || !Array.isArray(json.data.solutions)) {
-            if (solvedRecord.solutions.length === 0) {
-              alert("Không giải được đề bài: " + (json.error || "Dữ liệu trả về chưa đúng định dạng"));
-              return;
+          const batchSolutions = await callSolveBatchWithAutoRetry(
+            batch,
+            baseConfig,
+            currentAbortController.signal,
+            (retryMsg) => {
+              currentBatchStatus = retryMsg;
+              loadingText.textContent = `🔄 ${retryMsg} (${seconds}s)`;
             }
-            break;
-          }
+          );
 
-          json.data.solutions.forEach(item => {
+          batchSolutions.forEach(item => {
             const qKey = `${(item.question_number || '').trim()}|${(item.question_text || '').trim().slice(0, 45)}`;
             if (!seenQuestions.has(qKey)) {
               seenQuestions.add(qKey);
@@ -2581,9 +2636,9 @@
         } else {
           if (solvedRecord.solutions.length > 0) {
             saveItemToHistory(solvedRecord);
-            alert(`Mạng gián đoạn giữa chừng nhưng đã kịp lưu ${solvedRecord.solutions.length} câu đã giải xong!`);
+            alert(`Đã lưu ${solvedRecord.solutions.length} câu giải được trước khi gặp lỗi: ${err.message}`);
           } else {
-            alert("Kết nối mạng bị gián đoạn (" + err.message + "). Bạn hãy bấm thử lại nhé!");
+            alert("Không giải được đề bài: " + err.message);
           }
         }
       } finally {
